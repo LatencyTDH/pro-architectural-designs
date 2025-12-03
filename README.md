@@ -9,6 +9,12 @@ A collection of production-grade system design documents for complex, large-scal
 | [Airbnb](./airbnb/DesignAirbnb.md) | End-to-end design for a stays marketplace covering search, booking, payments, messaging, and multi-region resilience |
 | [Amazon Bedrock](./amazon-bedrock/DesignBedrock.md) | Serverless foundation model platform with inference orchestration, RAG, agents, and security hardening |
 
+## Cheatsheets
+
+| Topic | Description |
+|-------|-------------|
+| [Latency Numbers](./cheatsheet/LatencyNumbers.md) | Essential latency numbers for back-of-the-envelope calculations |
+
 ## What's Covered
 
 Each design document includes:
