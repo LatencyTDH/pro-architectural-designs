@@ -452,7 +452,12 @@ graph TB
     MASTER --> WORKER4
     WORKER1 --> EFS
     WORKER2 --> EFS
-    S3_DATA --> MASTER
+    WORKER3 --> EFS
+    WORKER4 --> EFS
+    S3_DATA --> WORKER1
+    S3_DATA --> WORKER2
+    S3_DATA --> WORKER3
+    S3_DATA --> WORKER4
     MASTER --> S3_MODEL
     MASTER --> CW
     CW --> ALARM
@@ -2704,7 +2709,6 @@ graph TD
     R53 -- "Latency Routing" --> DP_A
     R53 -- "Failover" --> DP_B
     
-    CP_A <-- "Replication (<1s)" --> CP_B
     DDB_A <-- "Replication" --> DDB_B
     
     DP_A -.-> DDB_A
@@ -2857,7 +2861,8 @@ graph TD
 
     StepFn --> Master
     Master -- "Mount RO" --> BaseS3
-    Master -- "Stream Data" --> UserS3
+    UserS3 -- "Stream Data" --> Worker1
+    UserS3 -- "Stream Data" --> Worker2
     
     Master --> Worker1
     Master --> Worker2
