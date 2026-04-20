@@ -8,6 +8,7 @@ A collection of production-grade system design documents for complex, large-scal
 |--------|-------------|
 | [Airbnb](./airbnb/DesignAirbnb.md) | End-to-end design for a stays marketplace covering search, booking, payments, messaging, and multi-region resilience |
 | [Amazon Bedrock](./amazon-bedrock/DesignBedrock.md) | Serverless foundation model platform with inference orchestration, RAG, agents, and security hardening |
+| [Claude Managed Agents](./claude-managed-agents/DesignClaudeManagedAgents.md) | Hyperscale multi-tenant managed agent platform with durable event log, Firecracker isolation, and regional session stickiness |
 
 ## Cheatsheets
 
