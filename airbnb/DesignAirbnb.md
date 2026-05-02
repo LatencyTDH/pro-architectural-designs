@@ -440,36 +440,80 @@ This is the part of the system where being wrong costs the company directly — 
 
 ## Pricing & Rules
 
-* Inputs: base price, seasonal/holiday adjustments, demand signals, competitor sets, host preferences.
-* Dynamic pricing service provides suggestions and real-time quotes; never blocks booking if service is down—fallback to cache or last known.
-* Rules engine enforces min/max nights, lead time, gaps, check-in days, prep time, and group size constraints.
-* Precompute per listing per month rule masks to accelerate “fast feasibility” checks.
+Pricing is the most-changed field on a listing and one of the highest-leverage signals for both ranking and conversion. Rules (min stay, prep time, etc.) are the gate every booking attempt has to pass before we touch the calendar.
+
+* **Inputs:** base nightly price set by the host, seasonal/holiday adjustments, demand signals (real-time supply/demand from booking velocity in the same market), competitor price set (other listings in the same H3 cell with similar bedroom count and amenities — used to anchor the suggestion, not to undercut), and host preferences ("never go below $X," weekend premium, weekly/monthly discounts).
+* **Dynamic pricing service** provides *suggestions* to the host and *real-time quotes* during search/booking. It never blocks booking if it's down — the booking path falls back to the last cached quote, then to the listing's stored base price.
+  > *Why a fallback chain instead of a hard dependency?* The pricing model is a stateful, ML-driven service that retrains nightly and reads from many feature stores. It's relatively complex and therefore relatively likely to fail compared to a dumb price lookup. Booking, on the other hand, must work or the company doesn't make money. So pricing is treated as a soft dependency: best-effort during normal operation, never on the critical path.
+* **Rules engine** enforces min/max nights, lead time ("can't book more than 12 months out"), gap rules ("don't strand a 1-night orphan between two bookings"), allowed check-in days, prep time (cleaning buffer), and group size constraints.
+* **Precomputed rule masks per listing-month** to accelerate "fast feasibility" checks at search time.
+  > *What's a "rule mask"?* A bitmap, parallel to the availability bitmap, where bit `i` = 1 means "a stay starting on night `i` is allowed by this listing's rules" (given a fixed stay length being searched). Computing rules on the fly per listing per query would be expensive; precomputing the mask once per rule change and ANDing it with the availability bitmap at query time turns rule enforcement into the same sub-microsecond bitwise op as availability checking.
+* **Price snapshot at booking:** the exact quote shown to the guest is stored verbatim on the `Reservation` row at confirm time — nightly rate, fees, taxes, currency, FX rate. Future price changes never alter a confirmed booking.
+  > *Why snapshot here too?* Same reason as the policy snapshot in [Core Domain Model](#core-domain-model-simplified): a host raising their nightly rate the day after a booking must not retroactively change what the guest is charged. Reaching through to the live `PriceRule` at any point after confirm is a bug class waiting to happen.
 
 ## Messaging and Notifications
 
-* Messaging: chat threads per reservation/listing inquiry; push + email fallbacks.
-* Moderation: PII redaction (before booking), unsafe content detection (NLP), link obfuscation.
-* Real-time infra: WebSockets/HTTP2 SSE via edge; store messages in durable store with read replicas.
-* Notifications: template service + locale; rate limits; user preferences; retries with exponential backoff; multi-channel.
+Messaging is part of the trust loop, not just a chat feature — hosts and guests need to coordinate before a stay (codes, key handoff, special requests) and the platform needs to keep the conversation on-platform until a booking is confirmed.
+
+* **Messaging:** chat threads scoped per inquiry/reservation; push + email fallbacks if the user isn't currently connected.
+* **Moderation:**
+  + **PII redaction *before* booking is confirmed** (phone numbers, email addresses, external messaging handles, addresses) and **link obfuscation** (rewriting/blocking links to external sites).
+  > *Why this is a money problem, not just a safety problem:* Without redaction, a host and guest can swap WhatsApp numbers in the first message, complete the booking off-platform, and bypass the marketplace's service fee entirely — a behavior known as "disintermediation." Once booking is confirmed and money has flowed through the platform, the redaction is relaxed because the platform has already captured its fee. Redaction is implemented as a regex pass plus an ML classifier for obfuscated patterns (e.g., "five five five dot two one two one").
+  + **Unsafe content detection** (NLP classifier flagging harassment, threats, discrimination) routes flagged threads to T&S operators and can auto-suspend egregious senders.
+* **Real-time delivery:** WebSockets for active sessions (full-duplex, low-latency, supports typing indicators and read receipts); HTTP/2 Server-Sent Events as a fallback for clients/proxies that block long-lived WebSocket connections (some corporate networks); HTTP long-polling as a last resort.
+  > *Why all three?* WebSockets are the best UX but ~5–10% of clients can't reliably hold a WebSocket open through corporate proxies and aggressive mobile NATs. SSE works over plain HTTP/2 and survives most middleware. Falling all the way back to long-polling guarantees delivery even on hostile networks; the cost is more requests per minute, accepted as the tail-case price.
+* **Durability:** messages are written to a sharded store (by `thread_id`) with read replicas; the WebSocket layer is stateless and reads from the store, so any gateway can serve any thread on reconnect.
+* **Notifications:** template service with per-locale variants; rate limits per (user, channel) to prevent flooding; user preferences honored; retries with exponential backoff and jitter; multi-channel (push, email, SMS, in-app) with deduplication so a user doesn't get the same alert four ways.
 
 ## Reviews and Reputation
 
-* Double-blind reviews: each side has X days to submit; publish only after both or deadline.
-* Fraud/spam detection; ML for review helpfulness.
-* Seller quality: cancellation rate, response time, acceptance rate feed into ranking and trust surfaces.
+Reviews are the primary trust signal in a marketplace where strangers exchange keys to homes. The mechanics matter because the system is gamed constantly.
+
+* **Double-blind reviews:** each side has 14 days after checkout to submit a review; **neither review is published until both are submitted *or* the 14-day window closes.**
+  > *Why double-blind?* If reviews were published as they came in, the second reviewer could read the first and either retaliate ("you said I was loud, well your apartment was filthy") or mirror it (give a 5-star to match a 5-star they didn't deserve). Hiding both until both are in (or the window expires) decouples the two reviews and keeps each one honest. Releasing on deadline ensures a guest who refuses to review can't permanently block the host's review from being published.
+* **Fraud and spam detection:** ML classifiers flag review-bombing rings (clusters of accounts all posting on the same listing within hours), fake-positive reviews from accounts the host has incentivized, and copy-pasted text. Reviewer/reviewee account graphs are checked for suspicious connectivity (shared device, shared payment instrument, repeated co-occurrence of bookings).
+* **Review helpfulness ranking:** an ML model orders reviews on the listing page by predicted usefulness (long, specific, recent reviews from verified stays beat "Great place!" × 50).
+* **Host quality signals:** completion rate, cancellation rate, response rate, response time, acceptance rate, and average rating feed into search ranking and into trust badges ("Superhost"). These are computed as rolling windows (e.g., trailing 365 days) so a single bad month doesn't haunt a host forever and a single great year can't paper over a recent decline.
+  > *Why feed these into ranking and not just display them?* If a host's cancellation rate spikes, the worst outcome is that we keep funneling guests to them and create a wave of cancelled stays. Demoting them in search is faster than waiting for guests to learn about it from review text.
 
 ## Trust, Safety, and Risk
 
-* Identity: KYC for hosts; optional guest verification; document + selfie liveness; device fingerprinting; IP/fraud signals.
-* Risk scoring: real-time features (velocity, card risk, mismatch, graph connections), offline models; high-risk bookings require additional verification or manual review.
-* Content moderation: images and text scanning; adult/illegal content detection; auto takedown workflows.
-* Property damage protection: deposits or waiver products; claims flow integrated with payouts.
+A marketplace where guests stay alone in strangers' homes has a much lower error tolerance than a typical e-commerce platform. The cost of a bad actor isn't a refund — it's a person being unsafe.
+
+* **Identity verification:**
+  + **KYC (Know Your Customer)** is required for hosts before they can receive payouts. Hosts upload a government ID, take a selfie, and the platform runs a **liveness check** — the user is asked to perform a randomized action on camera (turn head, blink, follow a moving dot) so a static photo of someone else's ID can't pass.
+  + Guest verification is optional at signup but can become required for high-risk bookings (last-minute reservations of expensive properties by new accounts is a classic fraud signature).
+  + **Document forensics** check for tampering: font inconsistencies, missing security features, and reused stock images of IDs found in past fraud cases.
+  + **Device fingerprinting** ties accounts to a device identity (a hash of canvas rendering + fonts + screen + timezone + plugin set + IP-derived signals) so an attacker creating 50 accounts from the same machine is detected even when each uses a different email.
+* **Risk scoring:**
+  + Each booking is scored in real time on a feature vector that includes:
+    - **Velocity** — how many actions (signups, bookings, payment attempts, password resets) the account has performed in the last minute/hour/day. Sudden spikes are a fraud-ring tell.
+    - **Card risk** — BIN-level signals (issuing country, prepaid vs credit, 3DS support), AVS/CVV match results, and historical chargeback rates for the BIN.
+    - **Mismatch** — disagreements between billing address country, IP country, account country, and listing country. A single mismatch is normal (people travel); three at once is suspicious.
+    - **Graph connections** — "is this account connected to a known-bad account through a shared device, IP, payment method, address, phone, or referral chain?" Built as a graph traversal in a graph DB or precomputed connected-components batch job. The classic example: 20 accounts that all booked from the same Wi-Fi router last week and one of them just chargebacked.
+  + **Offline models** retrain nightly on confirmed-fraud labels; **online models** apply the latest weights to incoming bookings within 100ms.
+  + **High-risk bookings** are routed to: (a) step-up verification (3DS challenge, ID upload), (b) a manual review queue staffed by T&S operators, or (c) auto-block for the highest-risk percentile.
+* **Content moderation:** image classifiers detect adult content, weapons, illegal items in listing photos; text classifiers scan listing descriptions and messages for the same. Confirmed violations route to auto-takedown workflows; ambiguous cases go to human reviewers.
+* **Property damage protection:** deposits (held as a separate auth on the card) or first-party insurance ride along with each booking; the claims flow integrates with payouts so a host's payout can be partially withheld pending a damage claim, with clear timelines for resolution.
 
 ## Media and Content
 
-* Photo upload to object storage; virus scan; EXIF scrub; deduplicate; on-demand resizing via CDN edge workers; WebP/AVIF optimization.
-* Video support via transcode pipeline.
-* SEO: static prerendered listing pages with edge caching; sitemap generation; hreflang; canonical URLs.
+Photos are the single largest cost center on the infrastructure bill ([Cost and Performance Considerations](#cost-and-performance-considerations)) and one of the strongest predictors of conversion. They also carry safety and privacy risk.
+
+* **Upload pipeline:**
+  + Photos go directly to object storage from the client via signed URLs (skipping our application servers, which would otherwise be a bandwidth bottleneck).
+  + **Virus scan** before the photo is ever served — a malicious file disguised as a JPEG could exploit downstream image-processing libraries.
+  + **EXIF metadata scrub.**
+    > *Why this is non-negotiable:* EXIF data embedded in a phone photo includes the GPS coordinates of where it was taken — typically the host's actual home. If we served photos with EXIF intact, anyone could download a listing photo and pull the host's home address out of the metadata. Scrubbing EXIF is a privacy-critical operation, not an optimization.
+  + **Perceptual deduplication** — hash photos with a perceptual hash (pHash) so a host re-uploading the same photo with a tiny crop or compression doesn't double our storage. Also catches the case where a fraudster steals photos from a real listing to create a fake one.
+* **On-demand image transforms** at the CDN edge: a single source photo is resized, cropped, and re-encoded to whatever the requesting client needs (mobile thumbnail vs. desktop hero), cached at the edge, and never stored as separate variants in object storage.
+  > *Why on-demand instead of pre-generating every variant?* Pre-generating N variants for M photos means N×M files to store, and we don't know in advance which variants get used (a new device with a new screen size adds another N). On-demand transforms generate each variant once on first request and cache it; storage cost stays at 1× the originals.
+  + **WebP/AVIF encoding** for clients that support them.
+    > *Why these formats matter for cost:* AVIF is 30–50% smaller than JPEG at equivalent visual quality; WebP is 20–30% smaller. CDN egress is billed per byte. On a multi-petabyte image library, switching the dominant format from JPEG to AVIF cuts the egress bill by roughly a third — worth millions per year at our scale, with no UX downside for clients that support it. Older clients automatically get a JPEG fallback via content negotiation.
+* **Video** uploads go through a transcode pipeline that produces multiple bitrate ladders for adaptive streaming (HLS/DASH).
+* **SEO:**
+  + Listing pages are server-rendered and edge-cached so search-engine crawlers get fully-populated HTML, not a JavaScript shell.
+  + **Sitemap generation** publishes URL lists for crawlers; **`hreflang` tags** tell search engines which language/region a page targets so a French user searching Google sees the French version of a Lisbon listing, not the English one. **Canonical URLs** prevent duplicate-content penalties when the same listing is reachable via multiple parameter combinations.
 
 [Back to Top](#table-of-contents)
 
@@ -536,11 +580,27 @@ Caching is layered — each layer catches a different class of repeated work —
 
 ## Security and Privacy
 
-* Auth: OAuth/OIDC for clients; JWT access tokens; mTLS service-to-service; short-lived creds via SPIRE or IAM roles.
-* Secrets: HSM/KMS; envelope encryption; rotated on schedule.
-* Data protection: PII encryption at rest; field-level encryption for sensitive IDs; tokenization of payment data (never store PAN).
-* Compliance: GDPR/CCPA (consent, DSR tooling), PCI-DSS SAQ A-EP, ISO27001/SOC2.
-* Audit logging, tamper-evident logs for financial flows.
+This section is dense with acronyms; each one corresponds to a specific class of attack the design defends against. Plain-language version for each.
+
+* **End-user authentication: OAuth 2.0 + OpenID Connect (OIDC).**
+  > *What and why:* OAuth 2.0 is the protocol for issuing access tokens ("this token grants the bearer permission to call API X for user Y"). OIDC is a thin layer on top of OAuth that adds *identity* ("who is the user, verified by an identity provider"). Together they let us support both first-party login (email/password, social login via Google/Apple/Facebook) and third-party app integrations (a property-management tool acting on a host's behalf) using the same token-issuance machinery instead of inventing a bespoke login system per integration.
+* **Access tokens: short-lived JWTs, paired with longer-lived refresh tokens stored in HTTP-only cookies.**
+  > *Why short-lived JWTs and not session cookies?* JWTs are self-contained — a service can validate one with just the public key, no round-trip to a session store. That matters at 100k RPS where every microsecond of auth overhead costs real money. The downside of JWTs is that revoking one before its expiry is hard, which is why we keep their lifetime short (e.g., 15 minutes). Long-lived refresh tokens *do* live in a server-side store so they can be revoked instantly when a user logs out or signs in from a new device.
+* **Service-to-service authentication: mTLS (mutual TLS).**
+  > *Why both sides authenticate, not just the client to the server:* In a microservices mesh, an attacker who breaches one service shouldn't be able to call any other service freely just because they're on the internal network. With mTLS, the *callee* also verifies the *caller*'s certificate — so the booking service will only accept calls from services whose cert proves they're a legitimate caller (e.g., the API gateway). "Zero trust" in concrete terms.
+* **Workload identity: short-lived credentials issued by SPIRE / SPIFFE or cloud IAM (e.g., AWS IAM Roles for Service Accounts).**
+  > *Why short-lived:* If a service's credential is leaked from a logfile, a misconfigured backup, or a compromised pod, the leak is only useful for the credential's lifetime. Issuing 1-hour creds and rotating them automatically caps blast radius. SPIFFE is the standard that defines workload identity (a SPIFFE ID is a URI that names "the booking service running in the EU production cluster"); SPIRE is the runtime that issues and rotates the certs.
+* **Secrets at rest: HSM- or KMS-backed envelope encryption.**
+  > *What "envelope encryption" means:* Instead of encrypting every blob with the same key (a key-management nightmare — rotating it requires re-encrypting everything), we generate a unique data key per blob, encrypt the blob with the data key, and then encrypt the data key with a master key held in an HSM (Hardware Security Module) or KMS (Key Management Service). Rotating the master key only re-encrypts the data keys, not the blobs. The HSM/KMS guarantees the master key never leaves protected hardware in plaintext.
+* **PII protection:**
+  + **Encryption at rest** for everything; **field-level encryption** (a separate key per sensitive field, like government ID numbers and full date-of-birth) on top of that, so a stolen database backup doesn't yield those fields without also compromising KMS.
+  + **Tokenization for payment data — we never store the PAN (Primary Account Number, i.e., the card number).**
+  > *Why tokenization is fundamentally different from encryption:* Encryption means we hold the data and a key to decrypt it; if both are stolen we lose. Tokenization means the *PSP* (Stripe/Adyen/Braintree) holds the card number and gives us back an opaque token that only they can resolve back to a card. We can charge the card by sending the token plus an amount; we can't ever read the PAN ourselves. This shrinks our PCI-DSS audit scope from "the entire company" to "the few systems that handle tokens," which is the difference between a SAQ A-EP and a full Level 1 audit (an order of magnitude more expensive).
+* **Compliance:**
+  + **PCI-DSS SAQ A-EP** — the audit category for merchants who *redirect* card data to a PCI-compliant PSP but whose web pages serve the redirect (so they could in theory be tampered with to skim cards). Achievable because we tokenize. The full Level 1 audit (for merchants who store/process PANs directly) is roughly 10× the cost.
+  + **GDPR (EU) and CCPA (California)** — give users the right to know what data is held, request deletion, and opt out of sale of personal data. We expose a self-serve **DSR (Data Subject Request) tool** that automates account export and deletion across all systems within the legal deadline (30 days under GDPR).
+  + **SOC 2 Type II and ISO 27001** — third-party attestations that our security controls exist and operate as documented over a period of months. Required by enterprise B2B customers (channel managers, large property-management companies) before they'll integrate with us.
+* **Audit logging:** every privileged action (refund issued, payout frozen, listing suspended, T&S operator viewing a guest's PII) writes to a tamper-evident log. **Tamper-evident** means each entry is hashed with the previous entry's hash (a hash chain), so any after-the-fact modification breaks the chain and is detectable during audit — important for financial reconciliation and for proving to regulators that operator access wasn't abused.
 
 ## APIs (Illustrative)
 
@@ -550,7 +610,7 @@ Caching is layered — each layer catches a different class of repeated work —
   + body: listing\_id, start\_date, end\_date, guests, idempotency\_key
   + returns: hold\_token, price\_quote, expires\_at
 * POST /payments/intents
-  + body: reservation\_draft\_id or hold\_token, amount, currency, idempotency\_key
+  + body: hold\_token, amount, currency, idempotency\_key
 * POST /bookings/confirm
   + body: hold\_token, payment\_intent\_id, idempotency\_key
 * DELETE /bookings/holds/{hold\_token}
@@ -576,10 +636,21 @@ Caching is layered — each layer catches a different class of repeated work —
 
 ## Cost and Performance Considerations
 
-* Object storage and CDN dominate costs; use aggressive image compression and responsive images.
-* Search cluster rightsized with autoscaling; reserve capacity for peak seasons.
-* Redis sized for bitsets and hot keys; eviction policies carefully tuned; multi-AZ replication with disk-backed snapshots.
-* Use spot/preemptible instances for stateless workers; bin pack with K8s.
+The headline from [Discovery](#who-pays-and-how-big): spend on photos and search; don't over-provision the booking DB. Concretely:
+
+* **Object storage and CDN egress dominate the infrastructure bill** — typically 40–60% at marketplace scale. Mitigated by:
+  + Aggressive image compression (AVIF/WebP, see [Media and Content](#media-and-content)) — a 30% reduction here is a multi-million-dollar line item.
+  + **Responsive images** so a phone is served a 400px-wide thumbnail, not a 2400px hero. Doing this badly (always serving full-resolution) can double the egress bill overnight.
+  + Tiered storage: hot photos on standard object storage, cold photos (delisted/inactive listings) on infrequent-access tiers at ~1/3 the price.
+* **Search cluster** is the second-largest cost; rightsize with autoscaling on day-of-week patterns and **reserve capacity** for the seasonal peaks (late June, late December) months ahead because spot-buying compute on the day of peak is both expensive and unreliable.
+* **Redis sized for bitsets and hot keys** with carefully chosen eviction policies:
+  + **`allkeys-lfu` (Least Frequently Used) for the page-result cache** — hot queries stay hot.
+  + **`volatile-ttl` for sessions and idempotency tokens** — evict the closest-to-expiry first, since they're explicitly time-bounded.
+  + **`noeviction` for availability bitsets** — they must never be silently evicted because a cold-cache fetch would force a fallback to the slower index path during peak load. Capacity is provisioned to fit the entire working set; a missing bitset is treated as an alert, not a normal cache miss.
+  + Multi-AZ replication with disk-backed snapshots so a single AZ outage or a node restart doesn't cold-start the cache.
+* **Stateless workers (search front-ends, indexer workers, image transforms) on spot/preemptible instances**, bin-packed onto Kubernetes nodes.
+  > *What "bin packing" means here:* the cluster scheduler treats each node as a bin with a fixed CPU/RAM capacity and tries to fit as many pods as possible into each bin before starting a new one. Without bin packing, you get a cluster of half-full nodes, paying for capacity you're not using. With it, you get nodes running at 70–80% utilization. Spot/preemptible instances are 60–80% cheaper than on-demand but can be reclaimed by the cloud provider with 30–120 seconds notice — fine for stateless workloads that can lose a pod and recover (request retries, work-queue jobs); never for the booking DB.
+* **Don't over-provision the booking DB.** The full calendar working set (10M listings × ~400 nights × small row) fits comfortably in single-digit hundreds of GB — it's a small DB by modern standards. Buying a giant cluster "because bookings are critical" is a common waste; what bookings actually need is high availability and low write-tail-latency, both of which come from replication topology and disk choice, not from raw size.
 
 ## Operations and SRE
 
@@ -596,7 +667,7 @@ Caching is layered — each layer catches a different class of repeated work —
 ## Content and Policy Edge Cases
 
 * Time zones: store in UTC; compute nights with listing’s local time; display in user’s locale.
-* Daylight savings transitions handled via local calendar service.
+* Daylight savings transitions are handled via a local calendar service that knows each listing's IANA tz database zone (e.g., `Europe/Lisbon`); a "night" is always one calendar date in the property's local time, never a fixed 24-hour window — otherwise a guest would be charged for the wrong number of nights on the spring/fall DST changeover.
 * Prep time and buffer nights automatically block adjacent dates.
 * Partial approvals: allow “date shift” suggestions; handle extra guest fees, pet fees.
 * Accessibility filters validated with human review.
@@ -1092,8 +1163,9 @@ C --> OLTP[(Booking/Calendar DB)]
 
 #### Place Resolution (Text to Place)
 
-* Place DB: curated from OSM/Who’s On First/Geonames + provider (Mapbox/Google), with:
+* Place DB: curated from open and commercial geographic data sources — **OpenStreetMap (OSM)** for global polygons, **Who's On First** (a permissive-licensed gazetteer with stable IDs and hierarchies), **GeoNames** (a free database of place names with population and admin hierarchy), plus a commercial provider like Mapbox or Google for fresh POIs and high-quality address geocoding. The resulting Place DB stores:
   + place\_id, type (country/region/city/neighborhood/POI), polygon (GeoJSON), bbox, centroid, aliases/transliterations, popularity.
+  > *Why multiple sources?* No single source is both global, fresh, and licensed for our use. OSM has great coverage but inconsistent quality. Commercial providers are clean but expensive at our query volume. Combining them lets us route most queries to free sources and only fall through to paid lookups for hard cases (rare POIs, ambiguous addresses).
 * Geocoder service
   + /geo/resolve?q=“barcelona”&locale=es returns place\_id, polygon, bbox, display\_name, rank.
   + Fuzzy matching, typo tolerance, multi-lingual analyzers, popularity boosting.
@@ -1142,12 +1214,12 @@ S-->>G: proceed with index query using cell tokens
      + price filter in user currency using per-listing pre-indexed normalized\_price\_user\_ccy (updated daily or with FX trigger).
      + keyword text (optional) with BM25 or ANN for semantic search if needed.
    * Return top K’ candidates (e.g., 3000) by a fast recall rank (BM25 + static quality + distance + price prior), plus aggregations (facets, histograms).
-6. Availability pruning (Redis bitsets)
+3. **Availability pruning (Redis bitsets)**
    * Compute date mask M for requested [checkin, checkout). Include rule masks (min stay, day-of-week, prep).
    * Fetch bitsets for candidates in parallel (pipelined across Redis shards).
    * Keep those where (bitset AND M) contains a contiguous run covering (nights).
    * Adaptive widening: If < page\_size after prune, increase K’ and repeat one time.
-7. Scoring and ranking
+4. **Scoring and ranking**
    * Fetch personalization features (Feature Store).
    * Compute score = p(book|user, listing, context) via LTR model; calibrate per geo and device.
    * Apply diversity constraints (price bands, neighborhoods, property types) via greedy MMR/submodular optimization.
@@ -1230,6 +1302,7 @@ The single most-loaded technical phrase in any search system is "learning to ran
   + Availability bitsets (primary)
   + Popular H3 cell facet snapshots: counts, price histogram buckets for common filters; refreshed via background worker using Kafka change signals.
   + Search page results cache for hot queries; shard-aware to avoid thundering herds.
+    > *What "shard-aware" means here:* the cache key is hashed to a Redis shard, and on a miss the *first* requester acquires a short distributed lock and computes the result while subsequent requesters wait briefly and read the cached value. Without this, a popular query expiring ("Lisbon this weekend" at the start of peak hour) would trigger thousands of identical recomputations slamming the search index simultaneously — the classic thundering herd. With single-flight per shard, the index sees one recomputation per cache TTL.
 * Client caching
   + Debounce map move; send requests at most every 150–250 ms when dragging.
   + Reuse last candidate set for small viewport changes.
@@ -1253,6 +1326,7 @@ The single most-loaded technical phrase in any search system is "learning to ran
   + price\_normalized = price\_host\_currency \* fx\_rate[host->user]
   + fx\_rate updated multiple times per day; index stores price\_normalized for top 20 currencies; fallback convert at query-time for rare currencies.
 * Ranking uses price\_zscore within cell to avoid absolute price bias.
+  > *What's a z-score?* A standard statistical measure: `(value − mean) / standard_deviation`. A z-score of 0 means "average for this cell," +1 means "one standard deviation above average," −1 means "one below," etc. *Why use it for price?* A $300 listing is expensive in Lisbon and cheap in Manhattan. Feeding the raw price into the ranker would teach it to always demote $300 listings, which is wrong half the time. Feeding the z-score within the listing's H3 cell teaches it the actually useful signal: "is this listing expensive *for its market*?" — which is what guests are sensitive to.
 
 ### Facets and Aggregations at Scale
 
@@ -1274,7 +1348,8 @@ The single most-loaded technical phrase in any search system is "learning to ran
 ### Observability and Quality
 
 * Per-query diagnostics: timings for resolve, index, bitsets, rank, cache status
-* Quality dashboards: nDCG@k, book-through-rate, coverage, diversity metrics, bad-click rate
+* Quality dashboards: nDCG@k, book-through-rate, coverage, diversity metrics, bad-click rate.
+  > *What is nDCG@k?* "Normalized Discounted Cumulative Gain at k" — the standard offline metric for ranking quality. For each query, we have a labeled relevance score per result (e.g., 3 for booked, 2 for clicked-then-saved, 1 for clicked, 0 for ignored); DCG sums those scores with a logarithmic discount so a relevant result at position 1 counts more than the same result at position 10; "normalized" divides by the ideal DCG so the metric is in [0, 1] regardless of how many relevant results exist. **@k** means "only counting the top k positions" — because that's all the user actually sees. nDCG@10 going from 0.62 to 0.65 after a ranker change is a meaningful win.
 * Online experiments: assignment service; guardrails for conversion, cancellations, CS contacts
 
 ### Pseudocode: Server-Side Search
@@ -1358,6 +1433,7 @@ end
 * Degraded mode: If Redis bitset service is impaired, fallback to index-only availability\_ranges\_compact with a small false-positive rate; label results with “availability may have changed”.
 * Backpressure: If index latency > SLO, reduce K’ and prefer cached cell results; increase result TTLs temporarily.
 * Hotspots: Popular markets → pre-warm caches, shard pinning for high-density cells, autoscale search nodes with headroom.
+  > *What "shard pinning" means in this context:* normally the search cluster's shard placement is decided by the engine's load balancer based on overall load. For known-hot cells (Manhattan, central Paris) we override that and pin the corresponding shard's primary and replicas to dedicated, larger-instance nodes that aren't shared with cold-cell shards. This prevents a popular market from being noisy-neighbor'd by an indexing job on a quiet shard, and gives us a predictable performance ceiling on the queries that matter most for revenue.
 
 ### Key Trade-offs
 
@@ -1376,7 +1452,7 @@ end
 * Do you want Experiences integrated in v1 or later?
 * Preference for a global strongly-consistent DB vs cell-based regional booking?
 * Target cloud(s) and existing PSP preferences?
-* Adapt for specially the booking/DB choices and sketch a reference deployment topology with concrete tech picks?
+* Should we adapt the booking/DB choices specifically and sketch a reference deployment topology with concrete tech picks?
 * Elaborate more on concrete OpenSearch mappings, example H3 resolutions per zoom level, or the LTR feature dictionary and training cadence for your markets?
 
 [Back to Top](#table-of-contents)
