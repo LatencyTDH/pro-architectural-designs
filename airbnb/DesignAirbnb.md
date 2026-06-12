@@ -51,6 +51,7 @@ An end-to-end, production-grade design for Airbnb-style "Stays" (homes/rooms). I
   - [Multi-Region Topology (Option B)](#multi-region-topology-option-b-cell-based-booking)
   - [Core Data Model](#core-data-model-entity-relationship-diagram)
   - [Cancellation and Refund Saga](#cancellation-and-refund-saga)
+  - [Capture-Failure Compensation Saga](#capture-failure-compensation-saga)
 - [Part VI: Search & Discovery Deep-Dive](#part-vi-search--discovery-deep-dive)
   - [Search System: Detailed Design](#search-system-detailed-design)
     - [Objectives and SLOs](#objectives-and-slos)
@@ -284,10 +285,10 @@ An end-to-end, production-grade design for Airbnb-style "Stays" (homes/rooms). I
 * User(user\_id, type: guest|host, KYC\_state, risk\_score)
 * Listing(listing\_id, host\_id, location(H3/S2 index), attributes, photos, policies, min/max stays, check-in/out times)
 * PriceRule(listing\_id, date\_range, nightly\_price, fees, currency)
-* Availability(listing\_id, date, state: FREE|HELD|RESERVED, version, prep\_time)
+* Availability(listing\_id, date, state: FREE|HELD|RESERVED|EXTERNAL\_BLOCKED, version, prep\_time, external\_source)
 * Reservation(reservation\_id, listing\_id, guest\_id, start\_date, end\_date, status: PENDING|CONFIRMED|CANCELLED, total\_amount, currency, created\_at)
 * Payment(payment\_id, reservation\_id, intent\_id, status, amount, currency, fx\_rate, method, idempotency\_key)
-* Review(review\_id, listing\_id, guest\_id, host\_id, rating, text, blind\_until)
+* Review(review\_id, reservation\_id, listing\_id, author\_id, subject\_id, direction: GUEST\_TO\_HOST|HOST\_TO\_GUEST, rating, text, blind\_until)
 * Message(thread\_id, message\_id, sender\_id, text, attachments, redaction\_flags)
 
 ## Key Design Tenets
@@ -374,9 +375,10 @@ Search is the highest-traffic surface in the system (100k peak RPS). It must be 
 This is the part of the system where being wrong costs the company directly — angry hosts, double-booked guests, refunds, brand damage. Every choice here is biased toward correctness over performance.
 
 * **Data model:**
-  + One row per `(listing_id, date)`. One row = one night. Fields: `state` (FREE | HELD | RESERVED), `hold_token`, `hold_expiry`, `version`.
+  + One row per `(listing_id, date)`. One row = one night. Fields: `state` (FREE | HELD | RESERVED | EXTERNAL_BLOCKED), `hold_token`, `hold_expiry`, `version`, and — for imported blocks — `external_source` and `external_uid` (which feed blocked the night, and its event ID).
   + Stored in a strongly-consistent, partitioned database keyed by `(listing_id, date)`. Secondary index by date if needed for range queries.
   > *Why one row per night and not, say, a single row per booking with a date range?* Because the unit of contention is the night. Two overlapping bookings for the same listing collide on the *specific* nights they share. With a row-per-night model, the database's row-level locking does the conflict detection for free — no application-level range-overlap math, no edge cases around inclusive/exclusive endpoints, no ambiguity about what to lock. The cost is more rows (~3.65B at 10M listings × 365 nights) but rows are cheap and the schema compresses well.
+  > *Why a `version` column when the CAS keys on `state`?* The compare-and-set guarantees correctness on its own, so `version` is not load-bearing for the hold itself. It earns its place downstream: it increments monotonically on every state change and rides along in each `calendar_delta`, so the bitset builder and other consumers can discard out-of-order updates (last-writer-by-version wins) instead of corrupting the side-channel — and it gives a cheap optimistic-concurrency check for any non-CAS administrative write.
 
 * **Constraints enforced before we ever touch the calendar:**
   + Min/max stay, prep time (block N nights before/after a booking for cleaning), booking window (how far in advance), instant-book eligibility, gap rules (e.g., "don't leave a 1-night orphan").
@@ -415,6 +417,36 @@ This is the part of the system where being wrong costs the company directly — 
   + **Request-to-Book:** introduces a `PENDING_HOST_APPROVAL` state with a 24-hour TTL. The payment is *authorized* (funds reserved on the card) but *not captured* (not actually moved). If the host accepts, we capture and transition to RESERVED. If the host declines or the TTL expires, we void the auth and release the rows.
   > *Why a separate state and not just a longer HELD?* Two reasons. First, the calendar UI for hosts must distinguish "someone is currently checking out" (HELD, ephemeral) from "a guest is waiting for your decision" (PENDING_HOST_APPROVAL, action required). Second, payment authorizations don't last forever (~7 days on most card networks); a request that sits past auth lifetime needs a re-authorization scheduler, which only applies to this state.
 
+* **External calendar sync (iCal / channel managers):**
+  + Many hosts list the same unit elsewhere (Booking.com, Vrbo) and keep the calendars aligned with a channel manager that exchanges **iCal** feeds. This makes the calendar a *multi-writer* resource: our own booking flow is one writer, and every external platform the host syncs is another writer we neither control nor trust to be timely.
+  + **Inbound (import):** a per-listing **iCal poller** pulls each subscribed feed on a schedule (default every ~5 minutes; tighter for high-value listings, exponentially backed off on error). It diffs the fetched feed against the last-stored snapshot and emits `calendar_delta` events for newly-blocked and newly-freed nights. Those deltas ride the *same* pipeline as our own holds — updating the OLTP calendar and the Redis bitset — so search and booking see external blocks exactly the way they see ours.
+  + **Outbound (export):** we publish a signed, read-only iCal URL per listing reflecting our `RESERVED` and `EXTERNAL_BLOCKED` nights, so the host's other platforms can import *our* bookings symmetrically and the loop is closed in both directions.
+  + **A distinct state — `EXTERNAL_BLOCKED`:** imported blocks land in their own calendar state, never `RESERVED`. Because our hold path takes a night with `CAS ... WHERE state='FREE'`, an `EXTERNAL_BLOCKED` night is automatically un-holdable — the existing booking path rejects it with no new branch.
+  > *Why a separate state and not just RESERVED?* An external block is not our reservation: there is no guest, no payment, no `Reservation` row, and no cancellation policy we own. Folding it into `RESERVED` would corrupt occupancy metrics, payout projections, and the ops case-view timeline. `EXTERNAL_BLOCKED` carries the source feed ID and the external event UID, so reconciliation can tell "blocked because Booking.com sold it" apart from "blocked because the host took it offline."
+  > *Why polling and not webhooks?* The iCal standard is pull-only — there is no push channel. The freshness floor is therefore the poll interval, and the design must *assume* a blind window between an external booking and our next successful poll. We cannot close that window; we can only resolve the race it creates deterministically.
+
+* **Conflict resolution — first-confirm-wins:**
+  + During the blind window our calendar still shows a night as `FREE`, so a guest can book a night an external platform already sold. When the inbound delta later collides with our `HELD`/`RESERVED` night (or vice-versa), the night has been genuinely double-sold. One rule resolves it: **whichever booking reached a *confirmed* state first wins; the later one is auto-cancelled with a full refund and a host penalty.**
+  > *Why the penalty lands on the host, not either guest?* Neither guest did anything wrong, so neither absorbs the loss. The host chose to run multiple channels without a real-time-syncing channel manager and is the only party who could have prevented the overlap. The platform eats the refund and recovers part of it through the host's cancellation penalty and Superhost-status impact. This is the "first to confirm wins" rule locked in the [discovery conversation](#three-forking-questions) — a product decision as much as a technical one.
+  + **Trust boundary on timestamps:** our own `confirmed_at` is authoritative; an external feed's timestamps are untrusted. An external block can therefore never *retroactively* evict a night we already moved to `RESERVED` — our confirmed reservation always wins that tie, and the external sale becomes the loser by construction. This also stops a malicious or buggy feed from cancelling real, paid bookings.
+
+* **Reconciliation:**
+  + A nightly job re-fetches every feed in full, rebuilds the expected `EXTERNAL_BLOCKED` set per listing, and repairs nights that drifted because a poll was missed, a feed was malformed, or a delta was dropped. Drift beyond a threshold raises an alert and can auto-pause that listing's Instant Book until a human confirms the calendar.
+  > *Why a full re-fetch when we already process deltas?* Delta processing is fast but lossy under failure — a poller that crashes between fetch and emit loses a delta silently. A periodic full snapshot is the self-healing backstop, the same belt-and-suspenders logic as the hold sweeper plus lazy-revert above.
+
+```mermaid
+flowchart LR
+EXT[External Platforms<br/>Booking.com / Vrbo] -->|iCal feed| POLL[iCal Poller<br/>per-listing schedule]
+POLL --> DIFF[Diff vs last snapshot]
+DIFF -->|new blocks / frees| DELTA[(Kafka calendar_delta)]
+DELTA --> CALW[Calendar Writer]
+CALW --> OLTP[(Booking/Calendar DB<br/>EXTERNAL_BLOCKED nights)]
+CALW --> BIT[(Redis Bitsets)]
+OLTP -->|RESERVED + EXTERNAL_BLOCKED| EXPORT[Outbound iCal URL]
+EXPORT -. host imports our nights .-> EXT
+RECON[Nightly Reconciler<br/>full re-fetch] --> OLTP
+```
+
 ## Booking Flow (End-to-End)
 
 1. Client fetches Listing details (price, rules) + Availability bitset.
@@ -422,8 +454,10 @@ This is the part of the system where being wrong costs the company directly — 
 3. Booking Service validates with Pricing & Rules, calls Calendar (atomic hold). Returns hold\_token & price quote.
 4. Client enters payment; Payments Service creates PaymentIntent (3DS/SCA as needed), risk signals evaluated.
 5. On auth success, Booking Service calls Calendar to confirm reservation (HELD -> RESERVED) and persists Reservation.
-6. Payments capture; Payout scheduled; Notifications dispatched; Search index updated via Kafka.
-7. If any failure after hold: release calendar; if payment capture fails post-confirmation, follow compensating logic (rare; risk-managed).
+6. Capture per policy. **Immediate-capture** listings capture *before* the reservation is durably confirmed to the guest (auth → capture → RESERVED), so a capture failure means the booking simply never confirmed. **Deferred-capture** listings (capture at check-in minus X days) confirm on auth and capture later on a schedule. Then: payout scheduled; notifications dispatched; search index updated via Kafka.
+7. **If a step fails, compensate (saga):**
+   * *Before confirm* — hold taken but auth/risk fails or the guest abandons: release the calendar (HELD → FREE) and void any authorization. Idempotent and cheap; no reservation exists yet.
+   * *Deferred capture fails after confirm* — card declined, auth expired, or issuer outage when the scheduled capture runs. The reservation exists but the money didn't move, and we never leave an unfunded booking silently: we flag it `PAYMENT_PENDING` (payment `FAILED`, retrying), re-authorize and retry capture with backoff and dunning, and prompt the guest to fix or replace their method within a grace window. If it still fails, we run the [Capture-Failure Compensation Saga](#capture-failure-compensation-saga) — void/refund any partial movement, revert the nights (RESERVED → FREE, honoring prep/gap rules), release the host hold, and notify both parties.
 
 ## Payments and Payouts
 
@@ -529,8 +563,8 @@ Photos are the single largest cost center on the infrastructure bill ([Cost and 
   + **Booking/Calendar:**
     - **Option A (ideal):** a global, strongly-consistent database (Spanner-class) partitioned by `listing_id`. Multi-region writes with external consistency — the database itself coordinates the writes across regions and gives us a single, globally-consistent view.
       > *Why this is hard:* Achieving strong consistency across regions requires either a consensus protocol (Paxos/Raft) on every write, which adds inter-region round-trip latency (~50–100ms across continents), or specialized hardware (Spanner uses GPS-disciplined atomic clocks via TrueTime). Either way, you're paying real latency and real money for the simplicity.
-    - **Option B (pragmatic):** cell-based architecture. Each `listing_id` is deterministically pinned to a home region (e.g., a hash maps it to `eu-west-1` or `us-east-1`). All writes for that listing go to its home region. Reads can fan out anywhere. Cross-region failover is a documented runbook with RTO < 15 minutes.
-      > *Why this is the launch choice:* Per-region single-writer means each region can use a boring, well-understood RDBMS. The cost is that a guest in Tokyo booking a Lisbon listing pays the cross-region RTT (round-trip time) on the booking call — acceptable because booking is rare relative to search.
+    - **Option B (pragmatic):** cell-based architecture. Each listing is deterministically pinned to a home region **by the property's location** — a Lisbon listing lives in `eu-west-1`, a Denver listing in `us-east-1` — with a hash used only to spread listings *within* a region across shards, never to choose the region itself. All writes for that listing go to its home region. Reads can fan out anywhere. Cross-region failover is a documented runbook with RTO < 15 minutes.
+      > *Why pin by geography and not by a hash of `listing_id`?* A listing's calendar is edited mostly by its host and booked disproportionately by guests in or near its own region, so co-locating the calendar with the property keeps the *common* booking and the host's daily calendar edits in-region. Hashing `listing_id` would scatter homes randomly — a Lisbon apartment could land in `us-east-1`, adding a transatlantic round-trip to every local booking and every host calendar change. We still pay cross-region RTT for the genuinely cross-region case (a guest in Tokyo booking Lisbon), but that's the rare path, not the common one.
 * **Failure domains:**
   + **AZ-level (Availability Zone):** within a region, run N+1 capacity across 3 AZs so any single AZ failure is transparent. The data layer replicates synchronously across AZs.
     > *Why 3 AZs and not 2?* Quorum-based consensus protocols (Raft, Paxos) need a majority. With 2 AZs, losing one means losing quorum. With 3 AZs, you can lose any one and still have a 2-of-3 majority that can keep accepting writes.
@@ -599,6 +633,9 @@ This section is dense with acronyms; each one corresponds to a specific class of
 * **Compliance:**
   + **PCI-DSS SAQ A-EP** — the audit category for merchants who *redirect* card data to a PCI-compliant PSP but whose web pages serve the redirect (so they could in theory be tampered with to skim cards). Achievable because we tokenize. The full Level 1 audit (for merchants who store/process PANs directly) is roughly 10× the cost.
   + **GDPR (EU) and CCPA (California)** — give users the right to know what data is held, request deletion, and opt out of sale of personal data. We expose a self-serve **DSR (Data Subject Request) tool** that automates account export and deletion across all systems within the legal deadline (30 days under GDPR).
+  > *How "delete me" coexists with an immutable event log:* the right to erasure appears to collide head-on with the Kafka spine ([Eventing](#eventing-outbox-and-indexing-pipeline-cqrs)) and the tamper-evident audit log below — both deliberately append-only. We reconcile them with **crypto-shredding**: every user's PII is encrypted under a per-user data key (an extension of the envelope-encryption scheme above), and events and log entries store *ciphertext*, never plaintext. Honoring an erasure request means **destroying that user's data key**. The append-only history stays intact and the hash chain stays unbroken, but every field encrypted under the shredded key is now permanently unrecoverable — which is what "erased" means in law.
+  > *What about data that isn't crypto-shredded?* Mutable stores (the relational listing/user DB, the search index, caches) get hard deletes or **tombstones**; compacted Kafka topics receive a null-value tombstone on the user's key so log compaction physically drops the prior records. We deliberately *retain* a narrow, lawful set — financial and tax records for the statutory period, fraud signals for known-bad actors — keeping only the minimal pseudonymized fields the regulation permits.
+  > *Why the audit log can survive erasure:* the tamper-evident log records *that* an action happened and *who* performed it by stable internal ID, not by the subject's raw PII; any PII it references is itself crypto-shredded. We can therefore still prove to a regulator that privileged access was controlled, without that proof itself becoming un-erasable personal data.
   + **SOC 2 Type II and ISO 27001** — third-party attestations that our security controls exist and operate as documented over a period of months. Required by enterprise B2B customers (channel managers, large property-management companies) before they'll integrate with us.
 * **Audit logging:** every privileged action (refund issued, payout frozen, listing suspended, T&S operator viewing a guest's PII) writes to a tamper-evident log. **Tamper-evident** means each entry is hashed with the previous entry's hash (a hash chain), so any after-the-fact modification breaks the chain and is detectable during audit — important for financial reconciliation and for proving to regulators that operator access wasn't abused.
 
@@ -821,14 +858,14 @@ participant S as RiskSvc
 participant D as BookingDB
 participant E as Event Bus (Kafka)
 participant N as Notifications
-U->>G: POST /bookings/holds (listing, dates, guests, idempotency\_key)
+U->>G: POST /bookings/holds (listing, dates, guests, idempotency_key)
 G->>B: CreateHold(...)
 B->>R: Validate rules + price quote
 B->>C: Atomic hold (CAS FREE->HELD per night)
-C-->>B: hold\_token + expires\_at
-B-->>G: {hold\_token, price\_quote, expires\_at}
+C-->>B: hold_token + expires_at
+B-->>G: {hold_token, price_quote, expires_at}
 G-->>U: Show hold countdown
-U->>G: POST /payments/intents (hold\_token, amount, currency, idempotency\_key)
+U->>G: POST /payments/intents (hold_token, amount, currency, idempotency_key)
 G->>P: Create PaymentIntent
 P->>S: Risk checks (device, history, velocity)
 S-->>P: Risk OK
@@ -836,12 +873,12 @@ P-->>G: Requires 3DS?
 G-->>U: 3DS challenge (if needed)
 U->>G: 3DS resolved
 G->>P: Confirm intent (auth success)
-G->>B: POST /bookings/confirm (hold\_token, payment\_intent\_id)
+G->>B: POST /bookings/confirm (hold_token, payment_intent_id)
 B->>C: Confirm HELD->RESERVED (atomic in shard)
 C->>D: Persist reservation
 D-->>B: Reservation record
 B->>P: Capture now or schedule capture
-B-->>G: {reservation\_id, status=CONFIRMED}
+B-->>G: {reservation_id, status=CONFIRMED}
 G-->>U: Booking confirmed
 B--)E: reservation.created
 P--)E: payment.authorized/captured
@@ -858,14 +895,14 @@ end
 
 ```mermaid
 flowchart TD
-A["Start CreateHold(listing\_id, start, end, guests)"] --> B[Validate rules & pricing]
+A["Start CreateHold(listing_id, start, end, guests)"] --> B[Validate rules & pricing]
 B --> D[Begin transaction in listing shard]
-D --> E["Iterate dates [checkin, checkout): CAS FREE->HELD<br/>write hold\_token, expiry=now+TTL"]
+D --> E["Iterate dates [checkin, checkout): CAS FREE->HELD<br/>write hold_token, expiry=now+TTL"]
 E --> F{Any CAS failed?}
 F -- No --> G[Commit transaction]
-G --> H["Return {hold\_token, expires\_at, quote}"]
+G --> H["Return {hold_token, expires_at, quote}"]
 F -- Yes --> I[Rollback: release prior HELD by token]
-I --> J[Return NOT\_AVAILABLE]
+I --> J[Return NOT_AVAILABLE]
 ```
 
 ### Search Query Path
@@ -980,7 +1017,7 @@ subgraph B1
 API3[API + Services]
 BK3[(Booking DB Shard Group)]
 end
-Part[Deterministic Partitioner<br/>listing\_id -> cell] --> API1
+Part[Deterministic Router<br/>listing geo -> home cell] --> API1
 Part --> API2
 Part --> API3
 API1 --> BK1
@@ -1006,7 +1043,9 @@ erDiagram
     LISTING ||--o{ RESERVATION : receives
     RESERVATION ||--o{ PAYMENT : has
     LISTING ||--o{ REVIEW : receives
-    USER ||--o{ REVIEW : writes
+    RESERVATION ||--o{ REVIEW : yields
+    USER ||--o{ REVIEW : authors
+    USER ||--o{ REVIEW : "is subject of"
 
     USER {
       string user_id PK
@@ -1025,10 +1064,11 @@ erDiagram
     AVAILABILITY {
       string listing_id FK
       date date PK
-      enum state "FREE|HELD|RESERVED"
+      enum state "FREE|HELD|RESERVED|EXTERNAL_BLOCKED"
       string hold_token
       timestamp hold_expiry
       int version
+      string external_source
     }
     RESERVATION {
       string reservation_id PK
@@ -1052,8 +1092,11 @@ erDiagram
     }
     REVIEW {
       string review_id PK
+      string reservation_id FK
       string listing_id FK
-      string writer_id FK
+      string author_id FK
+      string subject_id FK
+      enum direction "GUEST_TO_HOST|HOST_TO_GUEST"
       int rating
       string text
       timestamp blind_until
@@ -1081,6 +1124,47 @@ P-->>B: Refund result
 B--)N: Notify guest & host
 N-->>U: Cancellation confirmed
 ```
+
+### Capture-Failure Compensation Saga
+
+This closes the one window the happy path leaves open: a **deferred-capture** booking that already confirmed on authorization, where the scheduled capture later fails (declined card, expired auth, issuer outage). Immediate-capture listings never enter this saga because they capture before confirming, so a failure there just means the booking never happened.
+
+```mermaid
+sequenceDiagram
+autonumber
+participant SCH as Capture Scheduler
+participant P as PaymentsSvc
+participant B as BookingSvc
+participant C as CalendarSvc
+participant N as Notifications
+participant U as Guest
+participant H as Host
+SCH->>P: Capture(reservation_id, idempotency_key)
+alt Capture succeeds
+  P-->>B: Captured
+  B->>B: Reservation stays CONFIRMED; schedule payout
+else Capture fails
+  P-->>B: Failure(reason)
+  B->>B: Flag reservation PAYMENT_PENDING (payment=FAILED, retrying)
+  B->>P: Re-authorize + retry capture (backoff)
+  B->>N: Dunning - ask guest to fix/replace card
+  N-->>U: "Update payment to keep your booking"
+  alt Recovered within grace window
+    U->>P: New/updated payment method
+    P-->>B: Captured
+    B->>B: Reservation -> CONFIRMED
+  else Grace window expires
+    B->>P: Void/refund any partial movement (idempotent)
+    B->>C: RESERVED -> FREE (respect prep/gap rules)
+    B->>N: Notify guest (cancelled) + host (night released)
+    N-->>U: Cancellation + reason
+    N-->>H: Night reopened for sale
+  end
+end
+```
+
+* **Why prefer capture-before-confirm when policy allows:** it collapses this entire saga into "the booking never happened." We accept the deferred-capture window only for listings whose policy requires it, and we treat the host's calendar as *provisionally held* until capture clears, so a late failure reopens the night promptly instead of stranding it until a no-show.
+* **Idempotency:** capture, void, and refund all carry idempotency keys, so retries and replayed PSP webhooks never double-move money.
 
 [Back to Top](#table-of-contents)
 
@@ -1149,9 +1233,9 @@ Here's a deep-dive into Airbnb's Search & Discovery system with concrete data mo
 #### Indexing and Availability Side-Channel Diagram
 ```mermaid
 graph LR
-L[Listing Service] -->|outbox| K1[(Kafka listing\_updated)]
-P[Pricing Service] -->|outbox| K2[(Kafka price\_updated)]
-C[Calendar Service] -->|outbox| K3[(Kafka calendar\_delta)]
+L[Listing Service] -->|outbox| K1[(Kafka listing_updated)]
+P[Pricing Service] -->|outbox| K2[(Kafka price_updated)]
+C[Calendar Service] -->|outbox| K3[(Kafka calendar_delta)]
 K1 & K2 --> X[Search Indexer]
 X --> SI[(Search Index)]
 K3 --> AV[Availability Updater]
@@ -1259,6 +1343,7 @@ I --> J[Cache & return]
   + Precompute also a prefix-sum/next-zero index per bitset chunk or do O(1) with bit tricks on machine words in Lua script running inside Redis (optional).
 * Consistency vs holds
   + Bitsets updated on hold/confirm/release; TTL sweeper ensures expired holds clear. Index might lag but Redis is source of truth for availability at search time.
+  > *Trade-off — holds remove inventory from search:* because a `HELD` night clears its availability bit, an in-progress (or even abandoned) checkout hides that night from other searchers for the hold TTL, although no booking exists yet. We accept this small over-removal deliberately: showing the night to a dozen guests who then race to book it produces eleven "just got booked" dead-ends after a click — a worse experience and wasted booking-path load than briefly hiding one night that the sweeper frees within ~10 minutes if the hold lapses.
 
 ### Ranking and Personalization
 
@@ -1413,7 +1498,7 @@ S->>R: pipelined mget bitsets
 R-->>S: bitsets
 S-->>S: prune by date mask
 alt Too few results
-S->>IDX: widen recall (size=2\*K')
+S->>IDX: widen recall (size=2*K')
 IDX-->>S: extra candidates
 S->>R: fetch bitsets for new IDs
 R-->>S: bitsets
